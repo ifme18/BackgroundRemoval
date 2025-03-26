@@ -1,18 +1,18 @@
 import streamlit as st
-from rembg import remove
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 import numpy as np
 from io import BytesIO
-import base64
 import os
 import traceback
 import time
+import cv2
+import mediapipe as mp
 
 st.set_page_config(layout="wide", page_title="Image Background Remover")
 
 st.write("## Remove background from your image")
 st.write(
-    ":dog: Try uploading an image to watch the background magically removed. Full quality images can be downloaded from the sidebar. This code is open source and available [here](https://github.com/tyler-simons/BackgroundRemoval) on GitHub. Special thanks to the [rembg library](https://github.com/danielgatis/rembg) :grin:"
+    ":dog: Try uploading an image to watch the background magically removed. Full quality images can be downloaded from the sidebar. This code is open source and available [here](https://github.com/tyler-simons/BackgroundRemoval) on GitHub. Special thanks to the [MediaPipe library](https://google.github.io/mediapipe/) :grin:"
 )
 st.sidebar.write("## Upload and download :gear:")
 
@@ -21,6 +21,10 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # Max dimensions for processing
 MAX_IMAGE_SIZE = 2000  # pixels
+
+# Initialize MediaPipe Selfie Segmentation
+mp_selfie_segmentation = mp.solutions.selfie_segmentation
+selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)  # 1 for full-body segmentation
 
 # Download the fixed image
 def convert_image(img):
@@ -44,16 +48,114 @@ def resize_image(image, max_size):
     
     return image.resize((new_width, new_height), Image.LANCZOS)
 
+# Preprocess image to enhance contrast, especially for hair
+def preprocess_image(image):
+    # Convert to RGB if necessary
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # Enhance contrast significantly to make hair stand out
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2.5)  # Increased to 2.5 for better hair detection
+    
+    # Enhance brightness to further separate hair from background
+    brightness = ImageEnhance.Brightness(image)
+    image = brightness.enhance(1.5)
+    
+    return image
+
+# Use MediaPipe to segment the person (including hair)
+def segment_person(image):
+    # Convert PIL image to numpy array (RGB)
+    image_array = np.array(image)
+    
+    # MediaPipe expects BGR format
+    image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+    
+    # Perform segmentation
+    results = selfie_segmentation.process(image_bgr)
+    
+    # Get the segmentation mask (values between 0 and 1)
+    mask = results.segmentation_mask
+    
+    # Convert mask to binary (0 or 255) with a threshold
+    mask = (mask > 0.5).astype(np.uint8) * 255
+    
+    # Smooth the mask to reduce jagged edges
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+    mask = (mask > 128).astype(np.uint8) * 255
+    
+    return mask
+
+# Refine the alpha channel to preserve hair details and remove whitish remnants
+def refine_hair_details(image, mask):
+    # Convert image to numpy array
+    img_array = np.array(image)
+    
+    # Ensure RGBA
+    if img_array.shape[2] == 3:
+        img_array = np.pad(img_array, ((0,0),(0,0),(0,1)), mode='constant', constant_values=255)
+    
+    # Extract channels
+    r, g, b, a = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2], img_array[:,:,3]
+    
+    # Use the MediaPipe mask as the new alpha channel
+    a = mask
+    
+    # Detect and remove whitish/greyish remnants
+    intensity = (r.astype(float) + g.astype(float) + b.astype(float)) / 3
+    whitish_mask = (intensity > 200) & (a < 255)  # Detect whitish areas with partial transparency
+    grey_mask = (a > 0) & (a < 255) & (abs(r - g) < 20) & (abs(g - b) < 20) & (abs(b - r) < 20)
+    
+    # Combine masks to remove unwanted areas
+    remove_mask = whitish_mask | grey_mask
+    
+    # Set these areas to fully transparent
+    r[remove_mask] = 0
+    g[remove_mask] = 0
+    b[remove_mask] = 0
+    a[remove_mask] = 0
+    
+    # Enhance alpha channel for hair: boost semi-transparent areas
+    semi_transparent = (a > 10) & (a < 200)
+    a[semi_transparent] = np.minimum(a[semi_transparent] * 1.8, 255).astype(np.uint8)
+    
+    # Smooth the alpha channel to reduce jagged edges around hair
+    a = cv2.GaussianBlur(a, (3, 3), 0)
+    
+    # Reconstruct the image
+    cleaned_array = np.stack([r, g, b, a], axis=-1)
+    
+    # Convert back to PIL Image
+    refined_image = Image.fromarray(cleaned_array.astype('uint8'), 'RGBA')
+    
+    return refined_image
+
 @st.cache_data
 def process_image(image_bytes):
     """Process image with caching to avoid redundant processing"""
     try:
         image = Image.open(BytesIO(image_bytes))
+        # Preprocess to enhance contrast
+        preprocessed = preprocess_image(image)
         # Resize large images to prevent memory issues
-        resized = resize_image(image, MAX_IMAGE_SIZE)
-        # Process the image
-        fixed = remove(resized)
-        return image, fixed
+        resized = resize_image(preprocessed, MAX_IMAGE_SIZE)
+        
+        # Convert to RGB if necessary
+        if resized.mode != 'RGB':
+            resized = resized.convert('RGB')
+        
+        # Segment the person using MediaPipe
+        mask = segment_person(resized)
+        
+        # Ensure the image has an alpha channel
+        if resized.mode != 'RGBA':
+            resized = resized.convert('RGBA')
+        
+        # Refine hair details and apply the mask
+        refined = refine_hair_details(resized, mask)
+        
+        return image, refined
     except Exception as e:
         st.error(f"Error processing image: {str(e)}")
         return None, None
