@@ -1,12 +1,11 @@
 import streamlit as st
-from rembg import remove, new_session
+from rembg import remove
 from PIL import Image, ImageOps, ImageEnhance
 import numpy as np
 from io import BytesIO
 import os
 import traceback
 import time
-import cv2
 
 st.set_page_config(layout="wide", page_title="Image Background Remover")
 
@@ -21,9 +20,6 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # Max dimensions for processing
 MAX_IMAGE_SIZE = 2000  # pixels
-
-# Create a session with the u2net_human_seg model
-human_seg_session = new_session(model_name="u2net_human_seg")
 
 # Download the fixed image
 def convert_image(img):
@@ -47,7 +43,7 @@ def resize_image(image, max_size):
     
     return image.resize((new_width, new_height), Image.LANCZOS)
 
-# Preprocess image to enhance contrast and sharpness for hair
+# Preprocess image to enhance contrast, especially for hair
 def preprocess_image(image):
     # Convert to RGB if necessary
     if image.mode != 'RGB':
@@ -55,19 +51,15 @@ def preprocess_image(image):
     
     # Enhance contrast significantly to make hair stand out
     enhancer = ImageEnhance.Contrast(image)
-    image = enhancer.enhance(3.5)  # Increased to 3.5 for better hair detection
+    image = enhancer.enhance(2.0)  # Increased from 1.5 to 2.0 for better hair detection
     
-    # Enhance brightness to further separate hair from background
+    # Optional: Enhance brightness to further separate hair from background
     brightness = ImageEnhance.Brightness(image)
-    image = brightness.enhance(1.5)
-    
-    # Enhance sharpness to make hair edges more defined
-    sharpness = ImageEnhance.Sharpness(image)
-    image = sharpness.enhance(2.5)  # Increased to 2.5 for sharper hair edges
+    image = brightness.enhance(1.2)
     
     return image
 
-# Refine the alpha channel to preserve hair details and remove whitish remnants
+# Refine alpha channel to preserve hair details
 def refine_hair_details(image):
     # Convert image to numpy array
     img_array = np.array(image)
@@ -79,26 +71,32 @@ def refine_hair_details(image):
     # Extract channels
     r, g, b, a = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2], img_array[:,:,3]
     
-    # Detect and remove whitish/greyish remnants more aggressively
+    # Create a mask for content (lower threshold to preserve semi-transparent hair)
+    content_mask = a > 10  # Lowered to 10 to catch fine hair strands
+    
+    # Detect greyish edge pixels (background remnants)
     intensity = (r.astype(float) + g.astype(float) + b.astype(float)) / 3
-    whitish_mask = (intensity > 150) & (a < 255)  # Lowered to 150 to catch more whitish areas
-    grey_mask = (a > 0) & (a < 255) & (abs(r - g) < 10) & (abs(g - b) < 10) & (abs(b - r) < 10)  # Very tight grey detection
+    grey_mask = (a > 0) & (a <= 50) & (abs(r - g) < 20) & (abs(g - b) < 20) & (abs(b - r) < 20)
     
-    # Combine masks to remove unwanted areas
-    remove_mask = whitish_mask | grey_mask
+    # For edge pixels and greyish areas, set to fully transparent
+    edge_mask = (a <= 50) | grey_mask
     
-    # Set these areas to fully transparent
-    r[remove_mask] = 0
-    g[remove_mask] = 0
-    b[remove_mask] = 0
-    a[remove_mask] = 0
+    # Preserve semi-transparent hair by not fully removing pixels with low alpha
+    # Only set to transparent if they are grey or very low alpha
+    r[edge_mask] = 0
+    g[edge_mask] = 0
+    b[edge_mask] = 0
+    a[edge_mask] = 0
     
-    # Enhance alpha channel for hair: boost semi-transparent areas, but only for non-whitish areas
-    semi_transparent = (a > 5) & (a < 200) & (intensity < 150)
-    a[semi_transparent] = np.minimum(a[semi_transparent] * 2.5, 255).astype(np.uint8)  # Increased to 2.5 for better hair visibility
+    # Enhance alpha channel for hair: boost semi-transparent areas
+    semi_transparent = (a > 10) & (a < 100)
+    a[semi_transparent] = np.minimum(a[semi_transparent] * 1.5, 255).astype(np.uint8)
     
-    # Smooth the alpha channel to reduce jagged edges around hair
-    a = cv2.GaussianBlur(a, (3, 3), 0)
+    # Optional: Smooth transition at content boundaries
+    if np.any(content_mask):
+        from scipy.ndimage import binary_dilation
+        boundary = binary_dilation(content_mask) & ~content_mask
+        a[boundary] = a[boundary] * 0.8  # Slightly less aggressive fade
     
     # Reconstruct the image
     cleaned_array = np.stack([r, g, b, a], axis=-1)
@@ -118,18 +116,18 @@ def process_image(image_bytes):
         # Resize large images to prevent memory issues
         resized = resize_image(preprocessed, MAX_IMAGE_SIZE)
         
-        # Use rembg with the u2net-human-seg session
+        # Background removal with parameters tuned for hair
         fixed = remove(
-            resized,
-            session=human_seg_session,  # Use the u2net_human_seg session
+            resized, 
             alpha_matting=True,
-            alpha_matting_foreground_threshold=180,  # Lowered for better hair detection
-            alpha_matting_erode_size=3,  # Reduced to preserve hair details
-            alpha_matting_base_threshold=5,  # Lowered to catch fine details
+            alpha_matting_foreground_threshold=200,  # Lowered to 200 for better hair detection
+            alpha_matting_erode_size=5,  # Reduced to 5 to preserve hair details
+            alpha_matting_base_threshold=10,  # Lowered to catch fine details
+            alpha_matting_method='natural',
             bgcolor=(0, 0, 0, 0)  # Force transparent background
         )
         
-        # Refine hair details and remove whitish remnants
+        # Refine hair details and clean up edges
         refined = refine_hair_details(fixed)
         
         return image, refined
